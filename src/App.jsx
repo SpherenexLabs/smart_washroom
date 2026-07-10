@@ -1418,20 +1418,19 @@
 
   const DEFAULT_DATA = {
     Gas: 0,
+    G_LED: 0,
     Hum: 0,
+    IR: 0,
     PIR: 0,
+    R_LED: 0,
     Relay: 0,
+    Relay1: 0,
+    Relay2: 0,
+    Relay3: 0,
+    Relay4: 0,
     Temp: 0,
     Ultra: 0,
     Water: 0,
-  };
-
-  const RELAY_NAMES = {
-    0: "All OFF",
-    1: "Fan ON",
-    2: "Light ON",
-    3: "Flush ON",
-    4: "Spray ON",
   };
 
   function toNumber(value) {
@@ -1439,8 +1438,13 @@
     return Number.isFinite(n) ? n : 0;
   }
 
-  function relayName(value) {
-    return RELAY_NAMES[Number(value)] || "Unknown";
+  function activeRelayNames(data) {
+    const active = [];
+    if (data.Relay1 === 1 || data.Relay === 1) active.push("Fan");
+    if (data.Relay2 === 1 || data.Relay === 2) active.push("Light");
+    if (data.Relay3 === 1 || data.Relay === 3) active.push("Flush");
+    if (data.Relay4 === 1 || data.Relay === 4) active.push("Spray");
+    return active.length ? active.join(", ") : "All OFF";
   }
 
   function getStatus(value, low, high) {
@@ -2452,11 +2456,12 @@
   }
 
   function Washroom3D({ data }) {
-    const humanDetected = data.PIR === 1 || data.Ultra === 1;
-    const fanOn = data.Relay === 1;
-    const lightOn = data.Relay === 2;
-    const flushOn = data.Relay === 3;
-    const sprayOn = data.Relay === 4;
+    const ultraNear = data.Ultra > 0 && data.Ultra <= 5;
+    const humanDetected = data.PIR === 1;
+    const fanOn = data.Relay1 === 1 || data.Relay === 1;
+    const lightOn = data.Relay2 === 1 || data.Relay === 2;
+    const flushOn = data.Relay3 === 1 || data.Relay === 3;
+    const sprayOn = data.Relay4 === 1 || data.Relay === 4;
 
     return (
       <div className="glass-card simulation-card realistic-simulation-card">
@@ -2502,8 +2507,8 @@
               <WaterTank value={data.Water} />
               <GasCloud value={data.Gas} />
               <HumanModel detected={humanDetected} />
-              <SensorBeams pir={data.PIR === 1} ultra={data.Ultra === 1} />
-              <RoomAccessories pir={data.PIR === 1} ultra={data.Ultra === 1} />
+              <SensorBeams pir={data.PIR === 1} ultra={ultraNear} />
+              <RoomAccessories pir={data.PIR === 1} ultra={ultraNear} />
             </group>
 
             <ContactShadows position={[0, 0.018, 0.08]} opacity={0.38} scale={10.8} blur={2.9} far={6} />
@@ -2526,8 +2531,9 @@
   export default function App() {
     const [data, setData] = useState(DEFAULT_DATA);
     const [history, setHistory] = useState([]);
-    const [autoMode, setAutoMode] = useState(false);
-    const [autoAction, setAutoAction] = useState("Auto mode is OFF");
+    const [autoMode, setAutoMode] = useState(true);
+    const [autoAction, setAutoAction] = useState("Auto mode is ON");
+    const [occupancyAlert, setOccupancyAlert] = useState(false);
     const [firebaseError, setFirebaseError] = useState("");
 
     const [thresholds, setThresholds] = useState({
@@ -2541,9 +2547,16 @@
       waterHigh: 90,
     });
 
-    const autoBusyRef = useRef(false);
-    const autoTimerRef = useRef(null);
+    const dataRef = useRef(DEFAULT_DATA);
+    const gasFanBusyRef = useRef(false);
+    const gasFanTimerRef = useRef(null);
+    const relay3BusyRef = useRef(false);
+    const relay4BusyRef = useRef(false);
+    const relay3TimerRef = useRef(null);
+    const relay4TimerRef = useRef(null);
+    const ultraNearRef = useRef(false);
     const humanWasDetectedRef = useRef(false);
+    const legacyAutomationDisabled = true;
 
     useEffect(() => {
       const washroomRef = ref(db, WASHROOM_PATH);
@@ -2555,14 +2568,22 @@
 
           const updated = {
             Gas: toNumber(value.Gas),
+            G_LED: toNumber(value.G_LED),
             Hum: toNumber(value.Hum),
+            IR: toNumber(value.IR ?? value.ir),
             PIR: toNumber(value.PIR),
+            R_LED: toNumber(value.R_LED),
             Relay: toNumber(value.Relay),
+            Relay1: toNumber(value.Relay1),
+            Relay2: toNumber(value.Relay2),
+            Relay3: toNumber(value.Relay3),
+            Relay4: toNumber(value.Relay4),
             Temp: toNumber(value.Temp),
             Ultra: toNumber(value.Ultra),
             Water: toNumber(value.Water),
           };
 
+          dataRef.current = updated;
           setData(updated);
 
           const time = new Date().toLocaleTimeString([], {
@@ -2594,31 +2615,37 @@
       return () => unsubscribe();
     }, []);
 
-    async function writeRelay(value) {
+    async function writeField(key, value) {
       try {
-        await set(ref(db, `${WASHROOM_PATH}/Relay`), Number(value));
-        setFirebaseError("");
+        await set(ref(db, `${WASHROOM_PATH}/${key}`), Number(value));
       } catch (error) {
-        setFirebaseError(error.message);
+        console.error(error);
+        queueMicrotask(() => setFirebaseError(error.message));
       }
     }
 
-    async function runAutoRelay(value, durationMs, actionText) {
-      if (autoBusyRef.current) return;
-
-      autoBusyRef.current = true;
-      setAutoAction(actionText);
-      await writeRelay(value);
-
-      autoTimerRef.current = setTimeout(async () => {
-        await writeRelay(0);
-        setAutoAction("Waiting for next sensor condition...");
-        autoBusyRef.current = false;
-      }, durationMs);
+    function queueStatusUpdate(message) {
+      queueMicrotask(() => setAutoAction(message));
     }
 
+    function queueOccupancyAlert(value) {
+      queueMicrotask(() => setOccupancyAlert(value));
+    }
+
+    async function writeRelay(relayNumber, value) {
+      await writeField(`Relay${relayNumber}`, value);
+    }
+
+    async function writeAllRelaysOff() {
+      await Promise.all([1, 2, 3, 4].map((relayNumber) => writeRelay(relayNumber, 0)));
+      await writeField("Relay", 0);
+    }
+
+    async function runAutoRelay() {}
+
     useEffect(() => {
-      if (!autoMode || autoBusyRef.current) return;
+      if (legacyAutomationDisabled) return;
+      if (!autoMode) return;
 
       const humanDetected = data.PIR === 1 || data.Ultra === 1;
 
@@ -2647,22 +2674,141 @@
       }
     }, [data, autoMode, thresholds]);
 
+    useEffect(() => {
+      writeField("G_LED", 1);
+
+      return () => {
+        if (gasFanTimerRef.current) clearTimeout(gasFanTimerRef.current);
+        if (relay3TimerRef.current) clearTimeout(relay3TimerRef.current);
+        if (relay4TimerRef.current) clearTimeout(relay4TimerRef.current);
+      };
+    }, []);
+
+    useEffect(() => {
+      if (!autoMode) return;
+
+      const ultraNear = data.Ultra > 0 && data.Ultra <= 5;
+
+      if (ultraNear && (data.G_LED !== 0 || data.R_LED !== 1)) {
+        Promise.all([writeField("G_LED", 0), writeField("R_LED", 1)]);
+        queueStatusUpdate("Ultra detected: G_LED OFF and R_LED ON");
+      }
+
+      if (ultraNear && !ultraNearRef.current) {
+        if (data.R_LED === 1) {
+          queueOccupancyAlert(true);
+          queueStatusUpdate("Washroom occupied: ultrasonic detected again while R_LED is ON");
+        }
+      }
+
+      if (!ultraNear) {
+        queueOccupancyAlert(false);
+      }
+
+      ultraNearRef.current = ultraNear;
+    }, [data.G_LED, data.R_LED, data.Ultra, autoMode]);
+
+    useEffect(() => {
+      if (!autoMode) return;
+
+      const nextRelay1 = data.PIR === 1 || gasFanBusyRef.current ? 1 : 0;
+      if (data.Relay1 !== nextRelay1) {
+        writeRelay(1, nextRelay1);
+        queueStatusUpdate(`PIR ${data.PIR === 1 ? "detected" : "clear"}: Relay1 ${nextRelay1}`);
+      }
+    }, [data.PIR, data.Relay1, autoMode]);
+
+    async function startGasFanCycle() {
+      if (gasFanBusyRef.current) return;
+
+      gasFanBusyRef.current = true;
+      queueStatusUpdate("Gas high: fan Relay1 ON for 10 seconds");
+      await writeRelay(1, 1);
+
+      gasFanTimerRef.current = setTimeout(async () => {
+        gasFanBusyRef.current = false;
+
+        if (dataRef.current.PIR === 1) {
+          queueStatusUpdate("Gas fan cycle finished: PIR still detected, fan stays ON");
+          return;
+        }
+
+        await writeRelay(1, 0);
+        queueStatusUpdate("Gas fan cycle finished: fan Relay1 OFF");
+
+        if (dataRef.current.Gas >= thresholds.gasHigh && autoMode) {
+          startGasFanCycle();
+        }
+      }, 10000);
+    }
+
+    useEffect(() => {
+      if (!autoMode || data.Gas < thresholds.gasHigh) return;
+      if (data.PIR === 1) return;
+
+      startGasFanCycle();
+    }, [data.Gas, data.PIR, thresholds.gasHigh, autoMode]);
+
+    useEffect(() => {
+      if (!autoMode) return;
+
+      const ultraNear = data.Ultra > 0 && data.Ultra <= 5;
+      const sensorDetected = data.PIR === 1 || ultraNear;
+      const nextRelay2 = data.Hum >= thresholds.humHigh || sensorDetected ? 1 : 0;
+      if (data.Relay2 !== nextRelay2) {
+        writeRelay(2, nextRelay2);
+        queueStatusUpdate(nextRelay2 ? "Detection/Humidity: Relay2 light ON" : "No detection and humidity normal: Relay2 OFF");
+      }
+    }, [data.Hum, data.PIR, data.Relay2, data.Ultra, thresholds.humHigh, autoMode]);
+
+    async function startTimedRelay(relayNumber, durationMs, busyRef, timerRef, label) {
+      if (busyRef.current) return;
+
+      busyRef.current = true;
+      setAutoAction(`IR detected: ${label} ON for ${durationMs / 1000} seconds`);
+      await writeRelay(relayNumber, 1);
+
+      timerRef.current = setTimeout(async () => {
+        await writeRelay(relayNumber, 0);
+        busyRef.current = false;
+
+        if (dataRef.current.IR === 1 && autoMode) {
+          startTimedRelay(relayNumber, durationMs, busyRef, timerRef, label);
+        } else {
+          setAutoAction(`${label} cycle finished`);
+        }
+      }, durationMs);
+    }
+
+    useEffect(() => {
+      if (!autoMode || data.IR !== 1) return;
+
+      startTimedRelay(3, 10000, relay3BusyRef, relay3TimerRef, "Relay3");
+      startTimedRelay(4, 5000, relay4BusyRef, relay4TimerRef, "Relay4");
+    }, [data.IR, autoMode]);
+
     async function handleModeChange() {
       const nextMode = !autoMode;
       setAutoMode(nextMode);
 
       if (nextMode) {
         setAutoAction("Auto mode started. Waiting for sensor condition...");
+        await writeField("G_LED", 1);
       } else {
-        if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
-        autoBusyRef.current = false;
-        humanWasDetectedRef.current = false;
+        if (gasFanTimerRef.current) clearTimeout(gasFanTimerRef.current);
+        if (relay3TimerRef.current) clearTimeout(relay3TimerRef.current);
+        if (relay4TimerRef.current) clearTimeout(relay4TimerRef.current);
+        gasFanBusyRef.current = false;
+        relay3BusyRef.current = false;
+        relay4BusyRef.current = false;
         setAutoAction("Manual mode enabled");
-        await writeRelay(0);
+        await writeAllRelaysOff();
       }
     }
 
-    const humanDetected = data.PIR === 1 || data.Ultra === 1;
+    const hasUltraReading = data.Ultra > 0;
+    const ultraNear = hasUltraReading && data.Ultra <= 5;
+    const humanDetected = data.PIR === 1;
 
     const alerts = useMemo(() => {
       const list = [];
@@ -2679,11 +2825,13 @@
       if (data.Water >= thresholds.waterHigh) list.push("Water level is HIGH");
       if (data.Water <= thresholds.waterLow) list.push("Water level is LOW");
 
+      if (occupancyAlert) list.push("Washroom occupied");
       if (humanDetected) list.push("Human detected inside washroom");
-      if (data.Relay > 0) list.push(`${relayName(data.Relay)} is active`);
+      if (data.IR === 1) list.push("IR detected: Relay3/Relay4 timed cycle active");
+      if (activeRelayNames(data) !== "All OFF") list.push(`${activeRelayNames(data)} active`);
 
       return list;
-    }, [data, thresholds, humanDetected]);
+    }, [data, thresholds, humanDetected, occupancyAlert]);
 
     return (
       <div className="app">
@@ -2698,7 +2846,7 @@
 
             <div className="hero-tags">
               <span>Firebase: /Public_Washroom</span>
-              <span>Relay: {relayName(data.Relay)}</span>
+              <span>Relays: {activeRelayNames(data)}</span>
               <span>{humanDetected ? "Human Detected" : "Washroom Empty"}</span>
             </div>
           </div>
@@ -2767,8 +2915,8 @@
 
               <StatusCard
                 title="Ultrasonic"
-                value={data.Ultra === 1 ? "Obstacle detected" : "Clear"}
-                active={data.Ultra === 1}
+                value={!hasUltraReading ? "No reading" : ultraNear ? `Near (${data.Ultra})` : `Clear (${data.Ultra})`}
+                active={ultraNear}
                 icon="📡"
               />
 
@@ -2781,8 +2929,8 @@
 
               <StatusCard
                 title="Relay Status"
-                value={relayName(data.Relay)}
-                active={data.Relay > 0}
+                value={activeRelayNames(data)}
+                active={activeRelayNames(data) !== "All OFF"}
                 icon="⚡"
               />
             </div>
@@ -2791,7 +2939,7 @@
               <div className="section-head">
                 <div>
                   <h3>Manual / Auto Control</h3>
-                  <p>Fan=1, Light=2, Flush=3, Spray=4, OFF=0</p>
+                  <p>Relay1 fan, Relay2 light, Relay3 flush, Relay4 spray</p>
                 </div>
 
                 <button
@@ -2803,34 +2951,34 @@
               </div>
 
               <div className="relay-grid">
-                <button disabled={autoMode} onClick={() => writeRelay(1)}>
+                <button disabled={autoMode} onClick={() => writeRelay(1, 1)}>
                   <span>🌀</span>
                   <b>Fan ON</b>
-                  <small>Send 1</small>
+                  <small>Relay1=1</small>
                 </button>
 
-                <button disabled={autoMode} onClick={() => writeRelay(2)}>
+                <button disabled={autoMode} onClick={() => writeRelay(2, 1)}>
                   <span>💡</span>
                   <b>Light ON</b>
-                  <small>Send 2</small>
+                  <small>Relay2=1</small>
                 </button>
 
-                <button disabled={autoMode} onClick={() => writeRelay(3)}>
+                <button disabled={autoMode} onClick={() => writeRelay(3, 1)}>
                   <span>🚽</span>
                   <b>Flush ON</b>
-                  <small>Send 3</small>
+                  <small>Relay3=1</small>
                 </button>
 
-                <button disabled={autoMode} onClick={() => writeRelay(4)}>
+                <button disabled={autoMode} onClick={() => writeRelay(4, 1)}>
                   <span>🚿</span>
                   <b>Spray ON</b>
-                  <small>Send 4</small>
+                  <small>Relay4=1</small>
                 </button>
 
-                <button className="off" onClick={() => writeRelay(0)}>
+                <button className="off" onClick={writeAllRelaysOff}>
                   <span>⛔</span>
                   <b>All OFF</b>
-                  <small>Send 0</small>
+                  <small>Relay1-4=0</small>
                 </button>
               </div>
 
